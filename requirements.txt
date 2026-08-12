@@ -1,0 +1,14 @@
+chromadb
+sentence-transformers
+streamlit
+requests
+python-docx
+python-dotenv
+fastapi
+uvicorn
+python-multipart
+
+# Опционально, только если понадобится распознавать НОВЫЕ аудио/видео
+# (тяжёлые зависимости, не устанавливай без необходимости):
+# faster-whisper
+# torch

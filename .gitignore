@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+chroma_db/
+data/
+.env
+run_api_service.log
+.claude/
+PROJECT_SUMMARY.md

@@ -1,0 +1,131 @@
+# RAG-система анализа транскриптов интервью
+
+Перенос проекта с Google Colab на локальный запуск. Главное отличие —
+векторная база ChromaDB теперь персистентная: хранится в папке
+`chroma_db/` и не пересоздаётся заново при каждом запуске.
+
+## Структура проекта
+
+```
+rag-transcripts/
+├── data/
+│   ├── docx/           ← сюда положи исходные .docx-транскрипты
+│   ├── audio/           ← сюда — аудио/видео, если понадобится Whisper
+│   └── transcripts/     ← сюда попадут JSON после парсинга/распознавания
+├── chroma_db/            ← персистентная база (создастся сама)
+├── config.py              ← пути, ключи, константы
+├── parse_docx.py          ← парсинг .docx в JSON
+├── transcribe.py          ← (опционально) распознавание аудио через Whisper
+├── summarize.py           ← суммаризация транскриптов через RouterAI
+├── indexing.py            ← чанкинг + эмбеддинги + запись в ChromaDB
+├── rag.py                 ← RAG-запрос к базе знаний
+├── app.py                 ← Streamlit-интерфейс (использует модули выше)
+├── requirements.txt
+└── .env.example
+```
+
+## Установка
+
+```
+pip install -r requirements.txt
+```
+
+Скопируй `.env.example` в `.env` и впиши свой RouterAI-ключ:
+
+```
+copy .env.example .env
+```
+
+## Порядок запуска
+
+1. Положи `.docx`-файлы транскриптов в `data/docx/`
+2. Спарси их в JSON:
+   ```
+   python parse_docx.py
+   ```
+3. (Опционально) Сделай краткие summary через LLM:
+   ```
+   python summarize.py
+   ```
+4. Построй/обнови векторный индекс:
+   ```
+   python indexing.py
+   ```
+5. Задай вопрос к базе знаний:
+   ```
+   python rag.py
+   ```
+
+Если появятся новые аудио/видеозаписи для распознавания — установи
+дополнительно `faster-whisper` и `torch` (закомментированы в
+requirements.txt, не ставь без необходимости — тяжёлые библиотеки) и
+запусти:
+```
+python transcribe.py путь/к/файлу.mp4
+```
+
+## Streamlit-интерфейс
+
+Загрузка .docx-файлов прямо в браузере, суммаризация и вопросы к базе знаний
+без командной строки. Запускается локально, без Colab/ngrok/туннелей —
+просто открывается на `localhost:8501`.
+
+```
+streamlit run app.py
+```
+
+Ключ RouterAI подхватится из `.env` автоматически; если файла нет — можно
+ввести его прямо в поле в левой панели интерфейса.
+
+## HTTP API (для n8n и других внешних систем)
+
+```
+uvicorn api:app --reload --port 8000
+```
+
+- `GET /health` — проверка, что сервис жив, и сколько чанков в базе
+- `POST /query` — вопрос к базе знаний: `{"question": "...", "top_k": 5}`,
+  в ответ `{"answer": "...", "chunks_in_base": N}`
+- `POST /process/parse` — парсит новые `.docx` из `data/docx/` в JSON
+  (пропускает уже распарсенные), в ответ `{"found": N, "parsed": N, "skipped": N}`
+- `POST /process/summarize` — суммаризация новых транскриптов через RouterAI,
+  в ответ `{"found": N, "processed": N, "skipped": N, "failed": N}`
+- `POST /process/index` — индексация новых транскриптов в ChromaDB,
+  в ответ `{"new_files": N, "skipped_files": N, "total_chunks": N}`
+- `POST /upload-transcript` — принимает `.docx` (multipart, поле `file`) и
+  сохраняет в `data/docx/`, откуда его подхватит `/process/parse`
+- `http://localhost:8000/docs` — интерактивная документация (Swagger UI)
+
+## Telegram-бот и автообработка через n8n
+
+Готовые к импорту воркфлоу лежат в `n8n_workflows/`:
+
+- **`telegram_bot.json`** — бот отвечает на вопросы к базе знаний и принимает
+  новые транскрипты прямо в чате. Работает через long polling
+  (`getUpdates`) — n8n сам опрашивает Telegram каждые 10 секунд, входящий
+  вебхук/туннель не нужен вообще (важно, так как ngrok/Cloudflare Tunnel не
+  работают стабильно из РФ).
+- **`process_transcripts.json`** — переиспользуемая цепочка
+  парсинг → суммаризация → индексация, вызывается как сабворкфлоу.
+- **`auto_process_schedule.json`** — раз в 15 минут проверяет `data/docx/`
+  через `process_transcripts` и, если появились новые файлы, шлёт
+  уведомление в Telegram.
+
+### Как поднять
+
+1. `docker start n8n`, открыть `http://localhost:5678`.
+2. Импортировать все три файла (Workflows → Import from File) —
+   **сначала `process_transcripts.json`**, он используется двумя другими.
+3. В `telegram_bot.json` и `auto_process_schedule.json`:
+   - в узле **Config** вписать `telegram_token` (получен через @BotFather)
+     и `allowed_chat_ids`/`allowed_chat_id` — свой Telegram `chat_id`
+     (узнать: написать боту и один раз вручную открыть
+     `https://api.telegram.org/bot<TOKEN>/getUpdates`, или спросить у
+     `@userinfobot`). Без allow-list бот отвечал бы любому, кто его найдёт, —
+     каждый ответ это платный вызов Claude через RouterAI.
+   - в узле **Execute Workflow** выбрать из списка `Process Transcripts`
+     (привязка по ID не переносится между инстансами n8n при импорте).
+4. Активировать оба воркфлоу.
+
+Написав боту текстовый вопрос, получишь ответ на основе транскриптов из базы;
+отправив `.docx`, он сохранится в `data/docx/` и сразу проиндексируется.

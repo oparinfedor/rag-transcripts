@@ -1,0 +1,338 @@
+{
+  "name": "TG Bot",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## TG Bot — RAG-запросы и приём транскриптов\nОпрашивает Telegram методом getUpdates (long polling) — входящий\nтуннель/вебхук не нужен, бот сам стучится наружу к Telegram.\n\n**После импорта:**\n1. В узле \"Config\" впиши telegram_token (получен через @BotFather)\n   и allowed_chat_ids — свой chat_id, через запятую если чатов\n   несколько (узнать: написать боту и один раз вручную дёрнуть\n   getUpdates, или спросить @userinfobot).\n2. В узле \"Execute Workflow\" выбери из списка \"Process Transcripts\"\n   (после его импорта).\n3. Активируй воркфлоу.\n\nТекстовое сообщение → вопрос к базе знаний (/query).\n.docx-файл → сохраняется в data/docx/ и сразу прогоняется через\nParse → Summarize → Index.\nСообщения от чужих chat_id тихо игнорируются.",
+        "height": 340,
+        "width": 420
+      },
+      "id": "a0-note",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-220, -280]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "seconds", "secondsInterval": 10 }]
+        }
+      },
+      "id": "a1-schedule",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a2a",
+              "name": "telegram_token",
+              "value": "PASTE_YOUR_BOT_TOKEN_HERE",
+              "type": "string"
+            },
+            {
+              "id": "a2b",
+              "name": "allowed_chat_ids",
+              "value": "PASTE_YOUR_CHAT_ID_HERE",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a2-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [260, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nconst offset = staticData.offset || 0;\nconst config = $input.first().json;\nreturn [{ json: { ...config, offset } }];"
+      },
+      "id": "a3-getoffset",
+      "name": "Get Offset",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [520, 0]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.telegram.org/bot{{ $json.telegram_token }}/getUpdates",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "offset", "value": "={{ $json.offset }}" },
+            { "name": "timeout", "value": "0" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a4-getupdates",
+      "name": "Get Updates",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [780, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nconst config = $node[\"Get Offset\"].json;\nconst response = $node[\"Get Updates\"].json;\nconst updates = response.result || [];\n\nif (updates.length === 0) {\n  return [];\n}\n\nconst maxId = Math.max(...updates.map(u => u.update_id));\nstaticData.offset = maxId + 1;\n\nconst allowedIds = String(config.allowed_chat_ids)\n  .split(',')\n  .map(s => s.trim())\n  .filter(Boolean);\n\nconst items = [];\nfor (const u of updates) {\n  const msg = u.message;\n  if (!msg || !msg.chat) continue;\n  const chatId = String(msg.chat.id);\n  if (!allowedIds.includes(chatId)) continue; // чужой chat_id — тихо дропаем\n\n  const doc = msg.document;\n  const isDocx = !!(doc && doc.file_name && doc.file_name.toLowerCase().endsWith('.docx'));\n\n  items.push({\n    json: {\n      telegram_token: config.telegram_token,\n      chat_id: chatId,\n      text: msg.text || '',\n      has_document: isDocx,\n      is_text: !isDocx && !!msg.text,\n      doc_file_id: isDocx ? doc.file_id : null,\n      doc_file_name: isDocx ? doc.file_name : null\n    }\n  });\n}\n\nreturn items;"
+      },
+      "id": "a5-process",
+      "name": "Process Updates & Split",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "a6-cond",
+              "leftValue": "={{ $json.has_document }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equal" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a6-if",
+      "name": "Has Document",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1300, 0]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.telegram.org/bot{{ $json.telegram_token }}/getFile",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [{ "name": "file_id", "value": "={{ $json.doc_file_id }}" }]
+        },
+        "options": {}
+      },
+      "id": "a7-getfileinfo",
+      "name": "Get File Info",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, -220]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.telegram.org/file/bot{{ $node[\"Process Updates & Split\"].json.telegram_token }}/{{ $json.result.file_path }}",
+        "options": {
+          "response": { "response": { "responseFormat": "file" } }
+        }
+      },
+      "id": "a8-download",
+      "name": "Download File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1820, -220]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const items = $input.all();\nfor (const item of items) {\n  if (item.binary && item.binary.data) {\n    item.binary.data.fileName = $node[\"Process Updates & Split\"].json.doc_file_name;\n    item.binary.data.mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';\n  }\n}\nreturn items;"
+      },
+      "id": "a9-rename",
+      "name": "Rename Binary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2080, -220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/upload-transcript",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            { "parameterType": "formBinaryData", "name": "file", "inputDataFieldName": "data" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a10-upload",
+      "name": "Upload Transcript",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2340, -220]
+    },
+    {
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "Process Transcripts"
+        },
+        "options": {}
+      },
+      "id": "a11-execute",
+      "name": "Execute Workflow",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [2600, -220],
+      "notesInFlow": true,
+      "notes": "Выбери воркфлоу 'Process Transcripts' из списка после его импорта."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $node[\"Process Updates & Split\"].json.telegram_token }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $node[\"Process Updates & Split\"].json.chat_id, text: \"Транскрипт «\" + $node[\"Process Updates & Split\"].json.doc_file_name + \"» добавлен и проиндексирован. В базе \" + $json.total_chunks + \" чанков.\" }) }}",
+        "options": {}
+      },
+      "id": "a12-sendconfirm",
+      "name": "Send Confirm",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2860, -220]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "a13-cond",
+              "leftValue": "={{ $json.is_text }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equal" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a13-if",
+      "name": "Has Text",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1560, 180]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/query",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ question: $json.text, top_k: 5 }) }}",
+        "options": {}
+      },
+      "id": "a14-query",
+      "name": "Query RAG",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1820, 100]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $node[\"Process Updates & Split\"].json.telegram_token }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $node[\"Process Updates & Split\"].json.chat_id, text: $json.answer }) }}",
+        "options": {}
+      },
+      "id": "a15-sendanswer",
+      "name": "Send Answer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2080, 100]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $node[\"Process Updates & Split\"].json.telegram_token }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chat_id: $node[\"Process Updates & Split\"].json.chat_id, text: \"Отправь вопрос текстом или .docx с транскриптом.\" }) }}",
+        "options": {}
+      },
+      "id": "a16-fallback",
+      "name": "Send Fallback",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1820, 340]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [[{ "node": "Config", "type": "main", "index": 0 }]]
+    },
+    "Config": {
+      "main": [[{ "node": "Get Offset", "type": "main", "index": 0 }]]
+    },
+    "Get Offset": {
+      "main": [[{ "node": "Get Updates", "type": "main", "index": 0 }]]
+    },
+    "Get Updates": {
+      "main": [[{ "node": "Process Updates & Split", "type": "main", "index": 0 }]]
+    },
+    "Process Updates & Split": {
+      "main": [[{ "node": "Has Document", "type": "main", "index": 0 }]]
+    },
+    "Has Document": {
+      "main": [
+        [{ "node": "Get File Info", "type": "main", "index": 0 }],
+        [{ "node": "Has Text", "type": "main", "index": 0 }]
+      ]
+    },
+    "Get File Info": {
+      "main": [[{ "node": "Download File", "type": "main", "index": 0 }]]
+    },
+    "Download File": {
+      "main": [[{ "node": "Rename Binary", "type": "main", "index": 0 }]]
+    },
+    "Rename Binary": {
+      "main": [[{ "node": "Upload Transcript", "type": "main", "index": 0 }]]
+    },
+    "Upload Transcript": {
+      "main": [[{ "node": "Execute Workflow", "type": "main", "index": 0 }]]
+    },
+    "Execute Workflow": {
+      "main": [[{ "node": "Send Confirm", "type": "main", "index": 0 }]]
+    },
+    "Has Text": {
+      "main": [
+        [{ "node": "Query RAG", "type": "main", "index": 0 }],
+        [{ "node": "Send Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Query RAG": {
+      "main": [[{ "node": "Send Answer", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

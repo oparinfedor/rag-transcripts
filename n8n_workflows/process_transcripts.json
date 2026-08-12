@@ -1,0 +1,75 @@
+{
+  "name": "Process Transcripts",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Process Transcripts\nПереиспользуемая цепочка: парсинг → суммаризация → индексация.\nВызывается через узел Execute Workflow из:\n- \"Автообработка по расписанию\" (по таймеру)\n- \"TG Bot\" (после загрузки .docx в чат)\n\nНичего настраивать не нужно — все три шага дёргают уже\nработающий api.py на host.docker.internal:8000.\nВыход воркфлоу = ответ последнего шага (/process/index):\n{new_files, skipped_files, total_chunks}.",
+        "height": 260,
+        "width": 380
+      },
+      "id": "b0-note",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -180]
+    },
+    {
+      "parameters": {},
+      "id": "b1-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/process/parse",
+        "options": {}
+      },
+      "id": "b2-parse",
+      "name": "Parse",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [260, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/process/summarize",
+        "options": {}
+      },
+      "id": "b3-summarize",
+      "name": "Summarize",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [520, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/process/index",
+        "options": {}
+      },
+      "id": "b4-index",
+      "name": "Index",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [780, 0]
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": {
+      "main": [[{ "node": "Parse", "type": "main", "index": 0 }]]
+    },
+    "Parse": {
+      "main": [[{ "node": "Summarize", "type": "main", "index": 0 }]]
+    },
+    "Summarize": {
+      "main": [[{ "node": "Index", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}
