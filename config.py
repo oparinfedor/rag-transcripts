@@ -26,7 +26,7 @@ CHROMA_PATH = str(BASE_DIR / "chroma_db")
 # папки под data/, у которых есть docx/.
 PROJECT_SLUG_RE = re.compile(r"^[a-zA-Z0-9_-]{1,50}$")
 ACTIVE_PROJECT_FILE = DATA_DIR / ".active_project"
-DEFAULT_PROJECT = "DEMO"
+DEFAULT_PROJECT = os.environ.get("DEFAULT_PROJECT", "demo")
 
 
 def validate_project(name):
@@ -82,7 +82,7 @@ CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 
 # --- Модель эмбеддингов ---
-EMBEDDING_MODEL = "paraphrase-multilingual-mpnet-base-v2"
+EMBEDDING_MODEL = "BAAI/bge-m3"
 
 SYSTEM_PROMPT = """Ты помогаешь анализировать транскрипты рабочих встреч.
 Тебе дают текст расшифровки встречи (может быть без разметки по спикерам).
