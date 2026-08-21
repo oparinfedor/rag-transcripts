@@ -8,6 +8,7 @@ import requests
 from config import ROUTERAI_API_KEY, API_URL, MODEL
 from indexing import get_embed_model, get_collection
 
+LAST_USAGE = {}
 
 def ask_knowledge_base(question, project, top_k=5, api_key=None):
     """api_key: если не передан, берётся ROUTERAI_API_KEY из .env
@@ -44,6 +45,9 @@ def ask_knowledge_base(question, project, top_k=5, api_key=None):
     response = requests.post(API_URL, headers=headers, json=payload)
     response.raise_for_status()
     data = response.json()
+
+    global LAST_USAGE
+    LAST_USAGE = data.get("usage", {})
 
     if "output_text" in data:
         return data["output_text"]
