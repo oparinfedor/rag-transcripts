@@ -9,3 +9,4 @@ PROJECT_SUMMARY.md
 inspect_chroma.py
 fix_missing_documents.py
 swap_collection.py
+eval_embeddings.py
