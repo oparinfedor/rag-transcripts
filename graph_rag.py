@@ -3,8 +3,9 @@ graph_rag.py
 
 Параллельная версия ask_knowledge_base() из rag.py — та же логика
 (эмбеддинг вопроса, поиск в Chroma, вызов LLM через RouterAI), но
-разложенная на узлы LangGraph с одной механикой, которой нет в линейной
-версии: самопроверка достаточности контекста с циклом.
+разложенная на узлы LangGraph с двумя механиками, которых нет в линейной
+версии: самопроверка достаточности контекста с циклом, и персистентная
+память между отдельными вызовами (сессиями).
 
 После поиска отдельный узел (grade) честно оценивает, отвечает ли
 найденный контекст на вопрос. Если нет — запрос переформулируется
@@ -12,6 +13,13 @@ graph_rag.py
 не зациклиться). Каждая повторная попытка исключает уже виденные чанки
 и накапливает контекст — так grade/generate в итоге видят объединение
 всех уникальных чанков, найденных за все попытки, а не только последние.
+
+Память реализована через штатный механизм LangGraph — checkpointer
+(SqliteSaver), а не самодельным способом. История вопросов/ответов
+пишется в conversation_memory.db и переживает перезапуск процесса:
+два отдельных запуска скрипта с одним и тем же thread_id продолжают
+один и тот же диалог, а с разными thread_id — независимые сессии,
+не видящие историю друг друга.
 
 (Раньше здесь был ещё узел router, решавший, нужен ли вообще поиск —
 убран после того, как сравнение на eval-датасете показало, что он на
@@ -26,20 +34,24 @@ README, не самого кода.)
                  +------ rewrite <--+
 
 Использование:
-    python graph_rag.py <project>
+    python graph_rag.py <project> [thread_id]
 
 Требования:
-    pip install langgraph --break-system-packages
+    pip install langgraph langgraph-checkpoint-sqlite --break-system-packages
 """
 
+import sqlite3
 import sys
+import uuid
 from pathlib import Path
-from typing import List, Optional, TypedDict
+from typing import Annotated, List, Optional, TypedDict
+import operator
 
 import requests
 
 from config import API_URL, MODEL, ROUTERAI_API_KEY
 from indexing import get_collection, get_embed_model
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 
@@ -57,6 +69,12 @@ class RAGState(TypedDict):
     max_retries: int
     answer: Optional[str]
     token_usage: dict
+    # Annotated с operator.add — LangGraph при чекпоинтинге ДОБАВЛЯЕТ то,
+    # что возвращает узел, к уже сохранённому списку, а не перезаписывает
+    # его. Именно это и даёт память между отдельными invoke() на одном
+    # thread_id: каждый новый вопрос дописывает свою пару в общую историю,
+    # не стирая предыдущие.
+    conversation_history: Annotated[List[str], operator.add]
 
 
 def call_llm(prompt: str, api_key: Optional[str] = None) -> tuple[str, dict]:
@@ -195,18 +213,31 @@ def rewrite_node(state: RAGState) -> dict:
 
 def generate_node(state: RAGState) -> dict:
     context = "\n\n---\n\n".join(state["context_blocks"])
+    history = state.get("conversation_history", [])
+    history_block = ""
+    if history:
+        history_block = (
+            "История предыдущих вопросов и ответов в этой сессии (используй, "
+            "если текущий вопрос ссылается на них — например, «а по нему», "
+            "«сравни с предыдущим»):\n\n" + "\n\n".join(history) + "\n\n---\n\n"
+        )
+
     prompt = f"""Отвечай на вопрос ТОЛЬКО на основе приведённого ниже контекста.
 Если ответа в контексте нет - честно скажи, что не нашёл информации, не выдумывай.
 В конце ответа обязательно укажи, из каких источников (названия файлов) взята информация.
 
-Контекст:
+{history_block}Контекст:
 {context}
 
 Вопрос: {state['original_question']}"""
 
     answer, usage = call_llm(prompt, state.get("api_key"))
     print("[generate] ответ сформирован")
-    return {"answer": answer, "token_usage": merge_usage(state.get("token_usage", {}), usage)}
+    return {
+        "answer": answer,
+        "token_usage": merge_usage(state.get("token_usage", {}), usage),
+        "conversation_history": [f"Вопрос: {state['original_question']}\nОтвет: {answer}"],
+    }
 
 
 # --- Условные переходы ---
@@ -217,7 +248,7 @@ def route_after_grade(state: RAGState) -> str:
     return "rewrite"
 
 
-def build_graph():
+def build_graph(checkpointer=None):
     graph = StateGraph(RAGState)
     graph.add_node("retrieve", retrieve_node)
     graph.add_node("grade", grade_node)
@@ -230,18 +261,46 @@ def build_graph():
     graph.add_edge("rewrite", "retrieve")
     graph.add_edge("generate", END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
-def ask_knowledge_base_graph(question: str, project: str, top_k: int = 5, api_key: str = None, max_retries: int = 2) -> dict:
+_checkpoint_conn = None
+
+
+def _get_checkpointer():
+    """Открывает SQLite-соединение для памяти один раз на процесс и
+    переиспользует его между вызовами — так conversation_memory.db не
+    открывается заново на каждый вопрос."""
+    global _checkpoint_conn
+    if _checkpoint_conn is None:
+        _checkpoint_conn = sqlite3.connect("conversation_memory.db", check_same_thread=False)
+    return SqliteSaver(_checkpoint_conn)
+
+
+def ask_knowledge_base_graph(
+    question: str,
+    project: str,
+    top_k: int = 5,
+    api_key: str = None,
+    max_retries: int = 2,
+    thread_id: str = None,
+) -> dict:
     """Возвращает словарь с ответом и метаданными выполнения (нужно для
     сравнения со стоимостью линейной версии — см. compare_answers.py):
       - answer: текст ответа
       - retry_count: сколько раз сработал цикл rewrite -> retrieve
       - sources: источники, накопленные за все попытки retrieve (без дублей)
       - llm_calls: сколько раз всего был вызван LLM (grade/rewrite/generate)
+      - token_usage: суммарный usage за этот вызов
+      - thread_id: id сессии — передай его же в следующий вызов, чтобы
+        продолжить тот же диалог (память подтянется из conversation_memory.db,
+        переживает перезапуск процесса). Если не передать — каждый вызов
+        независим, как было раньше (используется compare_answers.py).
     """
-    app = build_graph()
+    thread_id = thread_id or str(uuid.uuid4())
+    checkpointer = _get_checkpointer()
+    app = build_graph(checkpointer)
+
     initial_state: RAGState = {
         "original_question": question,
         "current_query": question,
@@ -256,8 +315,10 @@ def ask_knowledge_base_graph(question: str, project: str, top_k: int = 5, api_ke
         "max_retries": max_retries,
         "answer": None,
         "token_usage": {},
+        "conversation_history": [],
     }
-    final_state = app.invoke(initial_state)
+    config = {"configurable": {"thread_id": thread_id}}
+    final_state = app.invoke(initial_state, config)
 
     retry_count = final_state["retry_count"]
     # grade на каждую попытку (retry_count+1) + rewrite на каждый повтор (retry_count) + generate(1)
@@ -269,6 +330,7 @@ def ask_knowledge_base_graph(question: str, project: str, top_k: int = 5, api_ke
         "sources": final_state["sources"],
         "llm_calls": llm_calls,
         "token_usage": final_state["token_usage"],
+        "thread_id": thread_id,
     }
 
 
@@ -276,8 +338,12 @@ if __name__ == "__main__":
     from config import get_active_project
 
     proj = sys.argv[1] if len(sys.argv) > 1 else get_active_project()
+    thread_id = sys.argv[2] if len(sys.argv) > 2 else None
+
     q = input("Вопрос: ")
-    result = ask_knowledge_base_graph(q, proj)
+    result = ask_knowledge_base_graph(q, proj, thread_id=thread_id)
     print(f"\n{result['answer']}")
     print(f"\n[метаданные] retry_count={result['retry_count']}, llm_calls={result['llm_calls']}, "
           f"token_usage={result['token_usage']}")
+    print(f"[сессия] thread_id={result['thread_id']} — передай его вторым аргументом "
+          f"следующему запуску, чтобы продолжить этот же диалог")
